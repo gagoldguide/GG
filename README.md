@@ -17,18 +17,36 @@ publisher, both lines land with us.
 
 ---
 
-## Status — Phase 0 (foundations) complete
+## Status — foundations + public marketing site complete
 
 Built and verified:
 
 - Next.js 16 + React 19 + TypeScript + Tailwind v4, matching the house stack
 - Full Prisma 7 schema (28 models) targeting Neon Postgres
-- **Money + gold valuation core, with 47 passing unit tests**
-- Contrast-verified design tokens — 27 pairings measured against WCAG, 0 failing
+- **Money + gold valuation core, with 60 passing unit tests**
+- Contrast-verified design tokens — 30 pairings measured against WCAG, 0 failing
 - Auth primitives: scrypt passwords, `jose` sessions, salted hashing, ULID click ids
-- Marketing shell: root layout, nav, footer, homepage
+- **30 routes**: homepage, gold calculator, live gold price, seller flow with TCPA consent
+  capture, buyer directory, guides, business pages, and legal pages
+- SEO/AEO layer: 90 schema nodes, sitemap, robots, `/llms.txt`
 
-Not built yet: portals, tracking engine, marketplace, city pages. See the phase plan.
+Verified on every build: 29 internal links crawled with **0 broken**, every sitemap URL resolves
+200, all JSON-LD parses, and every marked-up FAQ answer appears in visible page copy.
+
+**Not built yet:** the three portals (`/admin`, `/buyer`, `/publisher`), the tracking engine
+(`/c/[shortCode]`, `/api/postback`, call tracking), the bidding marketplace, and payout runs.
+
+### ⚠ Launch blockers
+
+1. **Legal pages are unreviewed drafts.** `/privacy`, `/terms`, `/cookies`,
+   `/privacy/do-not-sell` and the consent wording in `src/content/consent.ts` are substantive
+   drafts written to describe what the system actually does — so counsel reviews reality rather
+   than boilerplate — but **no lawyer has seen them**. Georgia counsel must review before launch.
+2. **No database.** `DATABASE_URL` is unset, so the buyer directory is empty, every city page
+   404s (correctly — see the publish gate below), and the seller form declines submissions
+   rather than pretending to store them.
+3. **No gold price feed.** Without `GOLD_API_KEY` the site shows no price and the calculator
+   asks the visitor to enter today's spot price manually.
 
 ---
 
@@ -90,7 +108,18 @@ valuation by 0.1%.
 physical verification. Presenting an estimate as a binding offer is a consumer-protection
 problem.
 
-**Never publish a payout-rate promise.** Rates are buyer-set and move with spot price.
+**Never publish a payout-rate promise.** Rates are buyer-set and move with spot price. The
+calculator's payout range is an *adjustable input the visitor controls*, not our claim.
+
+**The city publish gate.** `/gold-buyers/[city]` 404s unless the city is in the coverage list AND
+`City.published` is true AND it has at least one verified, active buyer. All three. ~50
+near-identical "gold buyers in {city}" pages with no real local data is the textbook doorway-page
+pattern and can suppress the whole domain. Do not add a `loading.tsx` to that route or to
+`/blog/[slug]` — a Suspense boundary makes Next commit HTTP 200 before `notFound()` runs, turning
+every miss into a soft 404.
+
+**No invented data, anywhere.** No fake stat bands, no placeholder buyer listings, no support
+email that bounces, no gold price when the feed is down. Empty states say they are empty.
 
 **Personal data is hashed, never stored raw** — IPs with a daily-rotating salt, phone numbers
 and emails with a stable one so they can still dedupe.

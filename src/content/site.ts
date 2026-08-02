@@ -54,8 +54,10 @@ export const nav = [
     href: '/gold-buyers',
     children: [
       { label: 'Browse all Georgia cities', href: '/gold-buyers' },
-      { label: 'Atlanta', href: '/gold-buyers/atlanta' },
+      // No individual city links here. A city page only exists once it has a verified buyer, so
+      // hardcoding one would ship a nav link straight into a 404.
       { label: 'How we verify licences', href: '/verification' },
+      { label: 'Georgia dealer rules', href: '/learn/georgia-rules' },
     ],
   },
   {

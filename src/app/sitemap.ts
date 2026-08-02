@@ -18,20 +18,41 @@ import { prisma } from '@/lib/db'
 export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
   const now = new Date()
 
+  // Every entry here must resolve. /login is deliberately absent — it is noindex.
   const staticRoutes: MetadataRoute.Sitemap = [
-    { url: absoluteUrl('/'), lastModified: now, changeFrequency: 'weekly', priority: 1 },
-    {
-      url: absoluteUrl('/gold-calculator'),
+    ...(
+      [
+        ['/', 1.0, 'weekly'],
+        ['/gold-calculator', 0.9, 'weekly'],
+        ['/gold-price', 0.9, 'hourly'],
+        ['/sell', 0.9, 'weekly'],
+        ['/gold-buyers', 0.8, 'daily'],
+        ['/how-it-works', 0.7, 'monthly'],
+        ['/verification', 0.7, 'monthly'],
+        ['/mail-in-vs-in-person', 0.7, 'monthly'],
+        ['/learn', 0.7, 'weekly'],
+        ['/learn/karat-guide', 0.8, 'monthly'],
+        ['/learn/georgia-rules', 0.8, 'monthly'],
+        ['/for-buyers', 0.6, 'monthly'],
+        ['/for-buyers/pricing', 0.5, 'monthly'],
+        ['/for-buyers/integration', 0.5, 'monthly'],
+        ['/for-partners', 0.6, 'monthly'],
+        ['/for-partners/commissions', 0.5, 'monthly'],
+        ['/for-partners/payouts', 0.5, 'monthly'],
+        ['/blog', 0.5, 'weekly'],
+        ['/about', 0.4, 'monthly'],
+        ['/contact', 0.4, 'monthly'],
+        ['/privacy', 0.2, 'yearly'],
+        ['/privacy/do-not-sell', 0.2, 'yearly'],
+        ['/terms', 0.2, 'yearly'],
+        ['/cookies', 0.2, 'yearly'],
+      ] as const
+    ).map(([path, priority, changeFrequency]) => ({
+      url: absoluteUrl(path),
       lastModified: now,
-      changeFrequency: 'weekly',
-      priority: 0.9,
-    },
-    {
-      url: absoluteUrl('/gold-price'),
-      lastModified: now,
-      changeFrequency: 'hourly',
-      priority: 0.9,
-    },
+      changeFrequency,
+      priority,
+    })),
   ]
 
   // Best-effort. No database configured yet must not break the sitemap for the static pages.

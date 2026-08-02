@@ -463,14 +463,22 @@ model CallEvent {
 }
 
 model Lead {
-  id          String  @id @default(cuid())
-  clickId     String?
-  programId   String
-  publisherId String
+  id      String  @id @default(cuid())
+  clickId String?
 
-  click     Click?    @relation(fields: [clickId], references: [id], onDelete: SetNull)
-  program   Program   @relation(fields: [programId], references: [id], onDelete: Cascade)
-  publisher Publisher @relation(fields: [publisherId], references: [id], onDelete: Cascade)
+  /// NULLABLE ON PURPOSE. A public "what's my gold worth / get offers" enquiry arrives before it
+  /// belongs to anyone: there is no program until we route it to a buyer, and no publisher if the
+  /// visitor came direct. Forcing these would mean inventing an attribution at capture time — and
+  /// an invented attribution is a commission paid to the wrong party.
+  programId   String?
+  publisherId String?
+
+  click     Click?     @relation(fields: [clickId], references: [id], onDelete: SetNull)
+  program   Program?   @relation(fields: [programId], references: [id], onDelete: SetNull)
+  publisher Publisher? @relation(fields: [publisherId], references: [id], onDelete: SetNull)
+
+  /// Set when the lead is assigned to a buyer. Until then it is unrouted and bills nobody.
+  routedAt DateTime?
 
   name        String?
   emailHash   String?
@@ -482,7 +490,11 @@ model Lead {
   // consent is lawful federally again — but carriers still refuse shared-consent SMS, and
   // litigation volume is unchanged. Storing the exact on-screen disclosure text, the IP, the
   // user agent and the timestamp is the only thing that actually wins a TCPA claim.
-  consentText      String?
+  consentText String?
+  /// RAW IP, and the one deliberate exception to the hash-everything rule in src/lib/hash.ts.
+  /// A consent record has to be evidence: proving who consented, from where, and when is the
+  /// entire point, and a salted hash proves none of it to a court. Scoped to consent only —
+  /// click and audit IPs are still hashed.
   consentIp        String?
   consentUserAgent String?
   consentAt        DateTime?
@@ -498,6 +510,7 @@ model Lead {
 
   @@index([dedupeHash])
   @@index([programId, createdAt])
+  @@index([status, createdAt])
 }
 
 /// The billable event. Commission is computed ONCE, here, and stored. Rate changes never

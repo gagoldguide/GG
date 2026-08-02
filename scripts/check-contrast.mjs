@@ -126,6 +126,11 @@ const PAIRS = [
   ['warning-800', 'warning-50', 4.5, 'pending badge (soft variant)'],
   ['danger-700', 'danger-50', 4.5, 'danger badge (soft variant)'],
 
+  // Dark CTA band (CtaBand.tsx) — light text and a gold button on a deep vault background
+  ['ink-inverse', 'vault-900', 4.5, 'CTA band heading'],
+  ['vault-100', 'vault-900', 4.5, 'CTA band body text'],
+  ['ink', 'gold-500', 4.5, 'gold CTA button on the band'],
+
   // Non-text UI boundaries
   ['line-strong', 'surface', 3.0, 'input border / focus ring'],
 
