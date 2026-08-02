@@ -1,0 +1,13 @@
+# pnpm 10 blocks package build scripts by default. These are the ones this project genuinely
+# needs to run: Prisma's engines (the CLI needs them for db push/migrate), esbuild (vitest's
+# bundler), and sharp (Next's image optimiser).
+onlyBuiltDependencies:
+  - '@prisma/client'
+  - '@prisma/engines'
+  - prisma
+  - esbuild
+  - sharp
+
+# Native resolver binary — not required, and it is the noisiest one to build on Windows.
+ignoredBuiltDependencies:
+  - unrs-resolver

@@ -1,0 +1,25 @@
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+
+# next.js
+/.next/
+/out/
+/build
+next-env.d.ts
+*.tsbuildinfo
+
+# prisma — generated client lives in the source tree (Prisma 7 default)
+/src/generated/
+
+# env — NEVER commit. Real credentials for Neon/Twilio/gold API live here.
+.env
+.env.*
+!.env.example
+
+# misc
+.DS_Store
+*.pem
+/coverage
+.vercel

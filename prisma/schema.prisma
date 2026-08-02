@@ -1,0 +1,823 @@
+// Georgia Gold Network — CJ-style affiliate network + reverse-auction gold marketplace.
+//
+// IMPORTANT SCHEMA CONVENTIONS (read before editing):
+//
+//  * MONEY is Int = US cents. Never Float. A float commission is a rounding bug that only
+//    surfaces when a publisher disputes a payout — by which point the money is already gone.
+//
+//  * RATES are Int = basis points (bps). 3000 = 30.00%. Integers all the way down, so a
+//    commission calculation never touches a floating point number.
+//
+//  * WEIGHT is Int = milligrams. Same reasoning as money. Grams are a presentation concern.
+//    Conversion helpers live in src/lib/gold.ts (troy ounce = 31.1034768 g exactly).
+//
+//  * Do NOT put @map(...) on enum *values* — known Prisma 7 codegen bug (#28591).
+//
+//  * Postgres runs on Neon. The APP connects through the POOLED endpoint (serverless opens
+//    a connection per cold start and would exhaust Postgres otherwise); the CLI connects
+//    DIRECT, because a transaction pooler cannot run DDL. See prisma.config.ts.
+//
+//  * TWO INTEGRITY MECHANISMS carry the whole business — do not weaken either:
+//      1. Conversion.payoutId — an approved conversion attaches to exactly ONE payout, so
+//         nothing pays twice and nothing is silently dropped.
+//      2. GoldBuyer.balanceCents — we pay publishers, so we never accrue a commission a
+//         buyer has not funded. At the floor, the program pauses.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Role {
+  ADMIN
+  STAFF
+  BUYER
+  PUBLISHER
+  CONSUMER
+}
+
+enum AccountStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+enum ProgramStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  PAUSED_LOW_BALANCE
+  CLOSED
+}
+
+/// The four ways a gold buyer can owe money. A single program may run several at once.
+enum CommissionType {
+  PERCENT_OF_SALE
+  PER_CALL
+  PER_LEAD
+  SUBSCRIPTION
+}
+
+enum PartnershipStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  PAUSED
+}
+
+enum ConversionStatus {
+  PENDING
+  APPROVED
+  DISPUTED
+  REVERSED
+  PAID
+}
+
+enum LeadStatus {
+  NEW
+  VALID
+  DUPLICATE
+  REJECTED
+  DELIVERED
+}
+
+enum LotStatus {
+  DRAFT
+  LIVE
+  BIDDING
+  ACCEPTED
+  COMPLETED
+  EXPIRED
+  CANCELLED
+}
+
+enum LotMethod {
+  IN_PERSON
+  MAIL_IN
+}
+
+enum BidStatus {
+  ACTIVE
+  WITHDRAWN
+  ACCEPTED
+  REJECTED
+  EXPIRED
+}
+
+enum PayoutStatus {
+  DRAFT
+  APPROVED
+  PAID
+  FAILED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  OPEN
+  PAID
+  VOID
+}
+
+enum BalanceEntryType {
+  DEPOSIT
+  CHARGE
+  REFUND
+  ADJUSTMENT
+}
+
+/// US-standard gold fineness. Purity is derived as karat/24 in code, never stored —
+/// storing a rounded purity would silently change every valuation.
+enum Karat {
+  K10
+  K14
+  K18
+  K22
+  K24
+}
+
+enum ItemType {
+  RING
+  NECKLACE
+  BRACELET
+  EARRINGS
+  WATCH
+  COIN
+  BAR
+  DENTAL
+  SCRAP
+  OTHER
+}
+
+// ---------------------------------------------------------------------------
+// Parties
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String  @id @default(cuid())
+  email        String  @unique
+  passwordHash String?
+  role         Role    @default(CONSUMER)
+  name         String?
+
+  // Lockout state. Mirrors the discipline proven in gulu-mulu: limiting how often a code can
+  // be REQUESTED is worthless without limiting how often it can be GUESSED.
+  failedAttempts Int       @default(0)
+  lockedUntil    DateTime?
+
+  emailVerifiedAt DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  goldBuyer GoldBuyer?
+  publisher Publisher?
+  consumer  Consumer?
+  auditLogs AuditLog[]
+
+  @@index([role])
+}
+
+/// A licensed business that buys gold. The "advertiser" in CJ terms.
+model GoldBuyer {
+  id           String @id @default(cuid())
+  userId       String @unique
+  user         User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businessName String
+  slug         String @unique
+
+  // Location + service area
+  addressLine String
+  cityName    String
+  county      String?
+  zip         String
+  phone       String
+  websiteUrl  String?
+
+  // Georgia precious-metals permits are issued MUNICIPALLY (O.C.G.A. Title 43 Ch. 37 governs
+  // dealers, but the permit comes from the city/county). licenseVerified is a hard gate on
+  // bidding and on appearing in the directory — it is the trust product, not paperwork.
+  licenseNumber       String?
+  licenseMunicipality String?
+  licenseExpiry       DateTime?
+  licenseDocUrl       String?
+  licenseVerified     Boolean   @default(false)
+  licenseVerifiedAt   DateTime?
+
+  serviceRadiusMiles Int     @default(25)
+  acceptsMailIn      Boolean @default(false)
+
+  // Indicative payout range, in bps of melt value (6000 = 60% of melt). Displayed as a RANGE
+  // only — never as a promise, because the realised rate depends on assay and spot price.
+  payoutRateMinBps Int?
+  payoutRateMaxBps Int?
+
+  // PREPAID BALANCE. We pay publishers, so commission may never accrue against money the
+  // buyer has not funded. Below balanceFloorCents the program pauses automatically.
+  balanceCents      Int @default(0)
+  balanceFloorCents Int @default(0)
+
+  status    AccountStatus @default(PENDING)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  programs       Program[]
+  balanceEntries BalanceEntry[]
+  invoices       Invoice[]
+  bids           Bid[]
+  deals          Deal[]
+  cityLinks      CityBuyer[]
+
+  @@index([status, licenseVerified])
+  @@index([zip])
+}
+
+/// A traffic source. Our own city pages are a Publisher with isHouse = true — that is how the
+/// network earns from day one instead of waiting for outside affiliates to show up.
+model Publisher {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  siteName        String
+  siteUrl         String?
+  promotionMethod String?
+  isHouse         Boolean @default(false)
+
+  payoutMethod   String?
+  payoutDetails  String?
+  taxFormOnFile  Boolean @default(false)
+  minPayoutCents Int     @default(5000) // $50, matching CJ's direct-deposit threshold
+
+  status    AccountStatus @default(PENDING)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  partnerships    Partnership[]
+  clicks          Click[]
+  leads           Lead[]
+  conversions     Conversion[]
+  payouts         Payout[]
+  trackingNumbers TrackingNumber[]
+
+  @@index([status])
+}
+
+/// A consumer selling their gold. Accounts exist because they bid-shop across buyers.
+model Consumer {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  displayName   String?
+  zip           String?
+  phone         String?
+  phoneVerified Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  lots  Lot[]
+  deals Deal[]
+}
+
+// ---------------------------------------------------------------------------
+// Network — the CJ mechanics
+// ---------------------------------------------------------------------------
+
+model Program {
+  id          String    @id @default(cuid())
+  goldBuyerId String
+  goldBuyer   GoldBuyer @relation(fields: [goldBuyerId], references: [id], onDelete: Cascade)
+
+  name      String
+  status    ProgramStatus @default(DRAFT)
+  termsHtml String?
+
+  /// Last-click attribution window. 30 days matches the network default.
+  cookieWindowDays Int @default(30)
+
+  /// The house's cut, in bps of the publisher commission. CJ charges ~30%.
+  /// The buyer is billed publisherCommission + networkFee.
+  networkFeeBps Int @default(3000)
+
+  /// Flat monthly listing fee. 100% house revenue — no publisher share, no attribution.
+  monthlySubscriptionCents Int @default(0)
+
+  /// HMAC key for signed conversion postbacks. Rotatable; never exposed to publishers.
+  postbackSecret String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  commissionRules CommissionRule[]
+  partnerships    Partnership[]
+  clicks          Click[]
+  leads           Lead[]
+  conversions     Conversion[]
+  trackingNumbers TrackingNumber[]
+
+  @@index([status])
+}
+
+/// One rule per billable event type. Highest `priority` wins when several match.
+model CommissionRule {
+  id        String  @id @default(cuid())
+  programId String
+  program   Program @relation(fields: [programId], references: [id], onDelete: Cascade)
+
+  type  CommissionType
+  label String
+
+  /// PERCENT_OF_SALE: bps of the buyer-declared sale amount.
+  rateBps Int?
+
+  /// PER_CALL / PER_LEAD: flat commission paid to the publisher.
+  flatCents Int?
+
+  /// PER_CALL only: a call is billable once it passes this duration. We measure it ourselves,
+  /// so this revenue line needs no cooperation from the buyer and is the hardest to dispute.
+  callMinSeconds Int @default(90)
+
+  priority Int     @default(0)
+  active   Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([programId, type, active])
+}
+
+model Partnership {
+  id          String @id @default(cuid())
+  publisherId String
+  programId   String
+
+  publisher Publisher @relation(fields: [publisherId], references: [id], onDelete: Cascade)
+  program   Program   @relation(fields: [programId], references: [id], onDelete: Cascade)
+
+  status     PartnershipStatus @default(PENDING)
+  appliedAt  DateTime          @default(now())
+  approvedAt DateTime?
+  note       String?
+
+  trackingLinks TrackingLink[]
+
+  @@unique([publisherId, programId])
+  @@index([status])
+}
+
+model TrackingLink {
+  id            String      @id @default(cuid())
+  partnershipId String
+  partnership   Partnership @relation(fields: [partnershipId], references: [id], onDelete: Cascade)
+
+  shortCode      String  @unique
+  destinationUrl String
+  label          String?
+
+  createdAt DateTime @default(now())
+
+  clicks Click[]
+}
+
+model Click {
+  /// The clickId itself — a ULID, so it is time-sortable without coordination.
+  id String @id
+
+  trackingLinkId String?
+  publisherId    String
+  programId      String
+
+  trackingLink TrackingLink? @relation(fields: [trackingLinkId], references: [id], onDelete: SetNull)
+  publisher    Publisher     @relation(fields: [publisherId], references: [id], onDelete: Cascade)
+  program      Program       @relation(fields: [programId], references: [id], onDelete: Cascade)
+
+  subId String?
+
+  /// Hashed, never raw. A raw IP is personal data and adds nothing to attribution.
+  ipHash    String?
+  userAgent String?
+  referer   String?
+  cityName  String?
+
+  createdAt DateTime @default(now())
+
+  leads       Lead[]
+  callEvents  CallEvent[]
+  conversions Conversion[]
+
+  @@index([programId, createdAt])
+  @@index([publisherId, createdAt])
+}
+
+/// A Twilio number. Either statically assigned to one buyer/publisher pair, or a member of a
+/// rotating pool used for dynamic number insertion (DNI) on consumer-facing pages.
+model TrackingNumber {
+  id         String  @id @default(cuid())
+  e164       String  @unique
+  twilioSid  String? @unique
+  programId  String?
+  publisherId String?
+
+  program   Program?   @relation(fields: [programId], references: [id], onDelete: SetNull)
+  publisher Publisher? @relation(fields: [publisherId], references: [id], onDelete: SetNull)
+
+  poolName String?
+  isPooled Boolean @default(false)
+  active   Boolean @default(true)
+
+  createdAt DateTime @default(now())
+
+  callEvents CallEvent[]
+
+  @@index([poolName, active])
+}
+
+model CallEvent {
+  id               String         @id @default(cuid())
+  twilioCallSid    String         @unique
+  trackingNumberId String
+  trackingNumber   TrackingNumber @relation(fields: [trackingNumberId], references: [id], onDelete: Cascade)
+
+  /// Caller ID is hashed for the same reason IPs are.
+  fromHash        String?
+  durationSeconds Int      @default(0)
+  recordingUrl    String?
+  answeredAt      DateTime?
+  createdAt       DateTime  @default(now())
+
+  clickId String?
+  click   Click?  @relation(fields: [clickId], references: [id], onDelete: SetNull)
+
+  conversions Conversion[]
+
+  @@index([createdAt])
+}
+
+model Lead {
+  id          String  @id @default(cuid())
+  clickId     String?
+  programId   String
+  publisherId String
+
+  click     Click?    @relation(fields: [clickId], references: [id], onDelete: SetNull)
+  program   Program   @relation(fields: [programId], references: [id], onDelete: Cascade)
+  publisher Publisher @relation(fields: [publisherId], references: [id], onDelete: Cascade)
+
+  name        String?
+  emailHash   String?
+  phoneHash   String?
+  zip         String?
+  itemSummary String?
+
+  // TCPA record. The FCC one-to-one rule was VACATED (11th Cir., 24 Jan 2025), so shared
+  // consent is lawful federally again — but carriers still refuse shared-consent SMS, and
+  // litigation volume is unchanged. Storing the exact on-screen disclosure text, the IP, the
+  // user agent and the timestamp is the only thing that actually wins a TCPA claim.
+  consentText      String?
+  consentIp        String?
+  consentUserAgent String?
+  consentAt        DateTime?
+
+  /// sha256(phone + zip + day) — cheap same-day duplicate suppression so a buyer is never
+  /// billed twice for the same person filling the form twice.
+  dedupeHash String?
+
+  status    LeadStatus @default(NEW)
+  createdAt DateTime   @default(now())
+
+  conversions Conversion[]
+
+  @@index([dedupeHash])
+  @@index([programId, createdAt])
+}
+
+/// The billable event. Commission is computed ONCE, here, and stored. Rate changes never
+/// rewrite history — retroactive commission edits are how a network loses every publisher.
+model Conversion {
+  id   String         @id @default(cuid())
+  type CommissionType
+
+  programId   String
+  publisherId String
+  program     Program   @relation(fields: [programId], references: [id], onDelete: Cascade)
+  publisher   Publisher @relation(fields: [publisherId], references: [id], onDelete: Cascade)
+
+  clickId     String?
+  leadId      String?
+  callEventId String?
+  dealId      String?
+
+  click     Click?     @relation(fields: [clickId], references: [id], onDelete: SetNull)
+  lead      Lead?      @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  callEvent CallEvent? @relation(fields: [callEventId], references: [id], onDelete: SetNull)
+  deal      Deal?      @relation(fields: [dealId], references: [id], onDelete: SetNull)
+
+  /// The buyer's own reference (order id / deal ref). Half of the idempotency key.
+  externalRef String
+
+  /// PERCENT_OF_SALE only: what the buyer says they paid the consumer.
+  declaredSaleCents Int?
+
+  publisherCommissionCents Int
+  networkFeeCents          Int
+  currency                 String @default("USD")
+
+  status         ConversionStatus @default(PENDING)
+  disputedReason String?
+  postbackAt     DateTime?
+  approvedAt     DateTime?
+
+  payoutId String?
+  payout   Payout? @relation(fields: [payoutId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // THE IDEMPOTENCY LOCK. A replayed postback hits this and becomes a no-op instead of
+  // paying a second commission.
+  @@unique([programId, externalRef])
+  @@index([status, createdAt])
+  @@index([publisherId, status])
+}
+
+// ---------------------------------------------------------------------------
+// Marketplace — consumers list, verified buyers bid
+// ---------------------------------------------------------------------------
+
+model Lot {
+  id         String   @id @default(cuid())
+  consumerId String
+  consumer   Consumer @relation(fields: [consumerId], references: [id], onDelete: Cascade)
+
+  status LotStatus @default(DRAFT)
+  method LotMethod @default(IN_PERSON)
+  zip    String
+
+  /// Gold moves intraday. Both the snapshot and the derived indicative value are frozen onto
+  /// the lot so a bid can always be judged against the price it was made at.
+  spotPriceSnapshotCents Int?
+  indicativeMeltCents    Int?
+
+  expiresAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  items LotItem[]
+  bids  Bid[]
+  deal  Deal?
+
+  @@index([status, zip])
+}
+
+model LotItem {
+  id    String @id @default(cuid())
+  lotId String
+  lot   Lot    @relation(fields: [lotId], references: [id], onDelete: Cascade)
+
+  itemType ItemType @default(SCRAP)
+
+  /// The karat the consumer BELIEVES it is, from the hallmark. A hallmark is not an assay —
+  /// stamps carry legal tolerance and plated items are routinely mis-stamped. This is why
+  /// every bid is an estimate subject to physical verification.
+  karatClaimed Karat
+
+  weightMg    Int
+  photos      String[]
+  description String?
+
+  createdAt DateTime @default(now())
+}
+
+model Bid {
+  id          String    @id @default(cuid())
+  lotId       String
+  goldBuyerId String
+  lot         Lot       @relation(fields: [lotId], references: [id], onDelete: Cascade)
+  goldBuyer   GoldBuyer @relation(fields: [goldBuyerId], references: [id], onDelete: Cascade)
+
+  offerCents Int
+  conditions String?
+
+  /// Spot price at the moment the bid was placed. Without this a stale bid is unjudgeable.
+  spotAtBidCents Int
+
+  status    BidStatus @default(ACTIVE)
+  expiresAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  deal Deal?
+
+  @@unique([lotId, goldBuyerId])
+  @@index([lotId, status])
+}
+
+model Deal {
+  id          String    @id @default(cuid())
+  lotId       String    @unique
+  bidId       String    @unique
+  goldBuyerId String
+  consumerId  String
+
+  lot       Lot       @relation(fields: [lotId], references: [id], onDelete: Cascade)
+  bid       Bid       @relation(fields: [bidId], references: [id], onDelete: Cascade)
+  goldBuyer GoldBuyer @relation(fields: [goldBuyerId], references: [id], onDelete: Cascade)
+  consumer  Consumer  @relation(fields: [consumerId], references: [id], onDelete: Cascade)
+
+  appointmentAt DateTime?
+
+  /// Buyer-reported. If it lands materially below the accepted bid the conversion is held
+  /// DISPUTED rather than auto-approved — self-reported revenue always needs a gate.
+  finalPaidCents      Int?
+  confirmedByBuyerAt  DateTime?
+  discrepancyFlagged  Boolean   @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  conversions Conversion[]
+}
+
+// ---------------------------------------------------------------------------
+// Money
+// ---------------------------------------------------------------------------
+
+model BalanceEntry {
+  id          String    @id @default(cuid())
+  goldBuyerId String
+  goldBuyer   GoldBuyer @relation(fields: [goldBuyerId], references: [id], onDelete: Cascade)
+
+  type        BalanceEntryType
+  amountCents Int
+  ref         String?
+  description String?
+
+  createdAt DateTime @default(now())
+
+  @@index([goldBuyerId, createdAt])
+}
+
+model Payout {
+  id          String    @id @default(cuid())
+  publisherId String
+  publisher   Publisher @relation(fields: [publisherId], references: [id], onDelete: Cascade)
+
+  periodStart DateTime
+  periodEnd   DateTime
+  amountCents Int
+  status      PayoutStatus @default(DRAFT)
+  method      String?
+  reference   String?
+
+  paidAt    DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  conversions Conversion[]
+
+  @@index([publisherId, status])
+}
+
+model Invoice {
+  id          String    @id @default(cuid())
+  goldBuyerId String
+  goldBuyer   GoldBuyer @relation(fields: [goldBuyerId], references: [id], onDelete: Cascade)
+
+  periodStart   DateTime
+  periodEnd     DateTime
+  subtotalCents Int
+  feesCents     Int
+  totalCents    Int
+  status        InvoiceStatus @default(DRAFT)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([goldBuyerId, status])
+}
+
+/// Cached spot price. Doubles as an audit trail: every valuation and bid can point at the
+/// exact quote it used, and we stay inside the price API's rate limit.
+model SpotPriceSnapshot {
+  id               String   @id @default(cuid())
+  metal            String   @default("XAU")
+  pricePerOztCents Int
+  source           String
+  fetchedAt        DateTime @default(now())
+
+  @@index([metal, fetchedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Content / ops
+// ---------------------------------------------------------------------------
+
+/// Drives the Georgia city pages. `published` is a HARD GATE: a city page may only go live
+/// when it has at least one verified licensed buyer. ~50 near-identical city pages with no
+/// real local data is a textbook doorway-page pattern and can suppress the whole domain.
+model City {
+  id         String  @id @default(cuid())
+  slug       String  @unique
+  name       String
+  county     String?
+  population Int?
+
+  /// Municipality-specific facts that make the page genuinely unique: permit rules, hold
+  /// period, local notes. Empty content is a reason NOT to publish.
+  permitNote     String?
+  holdPeriodDays Int?
+  introHtml      String?
+
+  buyerCount Int     @default(0)
+  published  Boolean @default(false)
+
+  metaTitle       String?
+  metaDescription String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  buyers CityBuyer[]
+
+  @@index([published])
+}
+
+model CityBuyer {
+  id          String    @id @default(cuid())
+  cityId      String
+  goldBuyerId String
+  city        City      @relation(fields: [cityId], references: [id], onDelete: Cascade)
+  goldBuyer   GoldBuyer @relation(fields: [goldBuyerId], references: [id], onDelete: Cascade)
+
+  featured Boolean @default(false)
+  rank     Int     @default(0)
+
+  @@unique([cityId, goldBuyerId])
+}
+
+model Page {
+  id       String  @id @default(cuid())
+  slug     String  @unique
+  title    String
+  bodyHtml String
+  published Boolean @default(false)
+
+  metaTitle       String?
+  metaDescription String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Post {
+  id          String    @id @default(cuid())
+  slug        String    @unique
+  title       String
+  excerpt     String?
+  bodyHtml    String
+  coverUrl    String?
+  published   Boolean   @default(false)
+  publishedAt DateTime?
+
+  metaTitle       String?
+  metaDescription String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([published, publishedAt])
+}
+
+model AuditLog {
+  id     String  @id @default(cuid())
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  action     String
+  entityType String
+  entityId   String?
+  detail     String?
+  ipHash     String?
+
+  createdAt DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
+
+model FeatureFlag {
+  id          String   @id @default(cuid())
+  key         String   @unique
+  enabled     Boolean  @default(false)
+  description String?
+  updatedAt   DateTime @updatedAt
+}
